@@ -47,13 +47,16 @@ typedef enum {
     CONTAINER_RUNNING,
     CONTAINER_STOPPED,
     CONTAINER_KILLED,
+    CONTAINER_HARD_LIMIT_KILLED,
     CONTAINER_EXITED
 } container_state_t;
 
 typedef struct container_record {
     char id[CONTAINER_ID_LEN];
+    char rootfs[PATH_MAX];
     pid_t host_pid;
     time_t started_at;
+    time_t stop_requested_at;
     container_state_t state;
     unsigned long soft_limit_bytes;
     unsigned long hard_limit_bytes;
@@ -61,6 +64,8 @@ typedef struct container_record {
     int exit_signal;
     int stop_requested;
     int producer_finished;
+    int producer_thread_started;
+    pthread_t producer_tid;
     char log_path[PATH_MAX];
     pthread_cond_t exit_cv;
     struct container_record *next;
@@ -124,6 +129,8 @@ typedef struct {
 
 static volatile sig_atomic_t g_supervisor_stop = 0;
 static volatile sig_atomic_t g_sigchld_seen = 0;
+static volatile sig_atomic_t g_run_client_stop_requested = 0;
+static char g_run_client_container_id[CONTAINER_ID_LEN];
 
 static void usage(const char *prog)
 {
@@ -226,6 +233,8 @@ static const char *state_to_string(container_state_t state)
         return "stopped";
     case CONTAINER_KILLED:
         return "killed";
+    case CONTAINER_HARD_LIMIT_KILLED:
+        return "hard_limit_killed";
     case CONTAINER_EXITED:
         return "exited";
     default:
@@ -337,6 +346,20 @@ static container_record_t *find_container_by_pid_locked(supervisor_ctx_t *ctx, p
         cur = cur->next;
     }
     return NULL;
+}
+
+static int rootfs_in_use_locked(supervisor_ctx_t *ctx, const char *rootfs)
+{
+    container_record_t *cur = ctx->containers;
+
+    while (cur) {
+        if ((cur->state == CONTAINER_STARTING || cur->state == CONTAINER_RUNNING) &&
+            strncmp(cur->rootfs, rootfs, sizeof(cur->rootfs)) == 0)
+            return 1;
+        cur = cur->next;
+    }
+
+    return 0;
 }
 
 static void write_all_fd(int fd, const void *buf, size_t len)
@@ -464,6 +487,12 @@ static void handle_signal(int signo)
         g_supervisor_stop = 1;
 }
 
+static void handle_run_client_signal(int signo)
+{
+    (void)signo;
+    g_run_client_stop_requested = 1;
+}
+
 static void install_signal_handlers(void)
 {
     struct sigaction sa;
@@ -582,6 +611,30 @@ static void set_response(control_response_t *resp, int status, const char *fmt, 
     va_end(ap);
 }
 
+static void send_stop_request_for_run_client(const char *id)
+{
+    int fd;
+    struct sockaddr_un addr;
+    control_request_t req;
+
+    memset(&req, 0, sizeof(req));
+    req.kind = CMD_STOP;
+    strncpy(req.container_id, id, sizeof(req.container_id) - 1);
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+        write_all_fd(fd, &req, sizeof(req));
+
+    close(fd);
+}
+
 static int start_container(supervisor_ctx_t *ctx,
                            const control_request_t *req,
                            control_response_t *resp)
@@ -603,6 +656,11 @@ static int start_container(supervisor_ctx_t *ctx,
     if (find_container_by_id_locked(ctx, req->container_id) != NULL) {
         pthread_mutex_unlock(&ctx->metadata_lock);
         set_response(resp, -1, "container id already exists");
+        return -1;
+    }
+    if (rootfs_in_use_locked(ctx, req->rootfs)) {
+        pthread_mutex_unlock(&ctx->metadata_lock);
+        set_response(resp, -1, "rootfs already in use by another live container");
         return -1;
     }
     pthread_mutex_unlock(&ctx->metadata_lock);
@@ -628,6 +686,7 @@ static int start_container(supervisor_ctx_t *ctx,
 
     memset(rec, 0, sizeof(*rec));
     strncpy(rec->id, req->container_id, sizeof(rec->id) - 1);
+    strncpy(rec->rootfs, req->rootfs, sizeof(rec->rootfs) - 1);
     rec->started_at = time(NULL);
     rec->state = CONTAINER_STARTING;
     rec->soft_limit_bytes = req->soft_limit_bytes;
@@ -687,9 +746,10 @@ static int start_container(supervisor_ctx_t *ctx,
     parg->read_fd = pipefd[0];
     strncpy(parg->container_id, req->container_id, sizeof(parg->container_id) - 1);
 
-    if (pthread_create(&producer_tid, NULL, producer_thread, parg) == 0)
-        pthread_detach(producer_tid);
-    else {
+    if (pthread_create(&producer_tid, NULL, producer_thread, parg) == 0) {
+        rec->producer_tid = producer_tid;
+        rec->producer_thread_started = 1;
+    } else {
         close(pipefd[0]);
         free(parg);
     }
@@ -715,7 +775,14 @@ static void reap_children(supervisor_ctx_t *ctx)
                 } else if (WIFSIGNALED(status)) {
                     rec->exit_code = 128 + WTERMSIG(status);
                     rec->exit_signal = WTERMSIG(status);
-                    rec->state = rec->stop_requested ? CONTAINER_STOPPED : CONTAINER_KILLED;
+
+                    if (rec->stop_requested) {
+                        rec->state = CONTAINER_STOPPED;
+                    } else if (WTERMSIG(status) == SIGKILL) {
+                        rec->state = CONTAINER_HARD_LIMIT_KILLED;
+                    } else {
+                        rec->state = CONTAINER_KILLED;
+                    }
                 }
                 pthread_cond_broadcast(&rec->exit_cv);
                 unregister_from_monitor(ctx->monitor_fd, rec->id, rec->host_pid);
@@ -734,10 +801,31 @@ static void stop_all_containers(supervisor_ctx_t *ctx)
         while (cur) {
             if (cur->state == CONTAINER_RUNNING || cur->state == CONTAINER_STARTING) {
                 cur->stop_requested = 1;
+                cur->stop_requested_at = time(NULL);
                 kill(cur->host_pid, SIGTERM);
             }
             cur = cur->next;
         }
+    }
+    pthread_mutex_unlock(&ctx->metadata_lock);
+}
+
+static void escalate_stubborn_containers(supervisor_ctx_t *ctx)
+{
+    time_t now = time(NULL);
+    container_record_t *cur;
+
+    pthread_mutex_lock(&ctx->metadata_lock);
+    cur = ctx->containers;
+    while (cur) {
+        if ((cur->state == CONTAINER_RUNNING || cur->state == CONTAINER_STARTING) &&
+            cur->stop_requested &&
+            cur->stop_requested_at != 0 &&
+            now - cur->stop_requested_at >= 2) {
+            kill(cur->host_pid, SIGKILL);
+            cur->stop_requested_at = 0;
+        }
+        cur = cur->next;
     }
     pthread_mutex_unlock(&ctx->metadata_lock);
 }
@@ -752,6 +840,8 @@ static void free_all_metadata(supervisor_ctx_t *ctx)
 
     while (cur) {
         next = cur->next;
+        if (cur->producer_thread_started)
+            pthread_join(cur->producer_tid, NULL);
         pthread_cond_destroy(&cur->exit_cv);
         free(cur);
         cur = next;
@@ -833,6 +923,7 @@ static void handle_stop(supervisor_ctx_t *ctx, int client_fd, const char *id)
         }
         if (rec->state == CONTAINER_RUNNING || rec->state == CONTAINER_STARTING) {
             rec->stop_requested = 1;
+            rec->stop_requested_at = time(NULL);
             kill(rec->host_pid, SIGTERM);
             set_response(&resp, 0, "stop signal sent");
         } else {
@@ -931,8 +1022,17 @@ static int run_supervisor(const char *rootfs)
 {
     supervisor_ctx_t ctx;
     int rc;
+    struct stat st;
 
-    (void)rootfs;
+    if (stat(rootfs, &st) < 0) {
+        perror("stat base-rootfs");
+        return 1;
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "base-rootfs is not a directory: %s\n", rootfs);
+        return 1;
+    }
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.server_fd = -1;
@@ -987,6 +1087,8 @@ static int run_supervisor(const char *rootfs)
         if (g_sigchld_seen)
             reap_children(&ctx);
 
+        escalate_stubborn_containers(&ctx);
+
         FD_ZERO(&rfds);
         FD_SET(ctx.server_fd, &rfds);
         tv.tv_sec = 1;
@@ -1024,6 +1126,92 @@ static int run_supervisor(const char *rootfs)
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
     return 0;
+}
+
+static int send_run_request_with_signal_forwarding(const control_request_t *req)
+{
+    int fd;
+    struct sockaddr_un addr;
+    control_response_t resp;
+    ssize_t n;
+    char buf[1024];
+    struct sigaction sa, old_int, old_term;
+    int stop_sent = 0;
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect");
+        close(fd);
+        return 1;
+    }
+
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = handle_run_client_signal;
+    sigaction(SIGINT, &sa, &old_int);
+    sigaction(SIGTERM, &sa, &old_term);
+
+    g_run_client_stop_requested = 0;
+    memset(g_run_client_container_id, 0, sizeof(g_run_client_container_id));
+    strncpy(g_run_client_container_id, req->container_id, sizeof(g_run_client_container_id) - 1);
+
+    write_all_fd(fd, req, sizeof(*req));
+
+    while (1) {
+        n = read(fd, &resp, sizeof(resp));
+        if (n == (ssize_t)sizeof(resp))
+            break;
+
+        if (n < 0 && errno == EINTR) {
+            if (g_run_client_stop_requested && !stop_sent) {
+                send_stop_request_for_run_client(g_run_client_container_id);
+                stop_sent = 1;
+            }
+            continue;
+        }
+
+        fprintf(stderr, "Failed to read supervisor response\n");
+        close(fd);
+        sigaction(SIGINT, &old_int, NULL);
+        sigaction(SIGTERM, &old_term, NULL);
+        return 1;
+    }
+
+    if (resp.message[0] != '\0')
+        fprintf(resp.status == 0 ? stdout : stderr, "%s\n", resp.message);
+
+    while (1) {
+        n = read(fd, buf, sizeof(buf));
+        if (n > 0) {
+            write_all_fd(STDOUT_FILENO, buf, (size_t)n);
+            continue;
+        }
+
+        if (n < 0 && errno == EINTR) {
+            if (g_run_client_stop_requested && !stop_sent) {
+                send_stop_request_for_run_client(g_run_client_container_id);
+                stop_sent = 1;
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    close(fd);
+    sigaction(SIGINT, &old_int, NULL);
+    sigaction(SIGTERM, &old_term, NULL);
+
+    return resp.status == 0 ? 0 : (resp.status > 0 ? resp.status : 1);
 }
 
 static int send_control_request(const control_request_t *req)
@@ -1116,7 +1304,7 @@ static int cmd_run(int argc, char *argv[])
     if (parse_optional_flags(&req, argc, argv, 5) != 0)
         return 1;
 
-    return send_control_request(&req);
+    return send_run_request_with_signal_forwarding(&req);
 }
 
 static int cmd_ps(void)
