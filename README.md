@@ -46,7 +46,7 @@ ls -l /dev/container_monitor
 
 ```bash
 cp -a ./rootfs-base ./rootfs-alpha
-cp -a ./rootfs-beta ./rootfs-beta
+cp -a ./rootfs-base ./rootfs-beta
 ```
 
 To run workload binaries inside a container, copy them into the container's rootfs before launch:
