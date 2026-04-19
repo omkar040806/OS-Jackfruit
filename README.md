@@ -198,6 +198,8 @@ A long-running parent supervisor is necessary because container processes are ch
 
 The supervisor stays alive in a `select()` loop, accepting CLI connections and handling `SIGCHLD`. When a container exits, the kernel delivers `SIGCHLD` to the supervisor. A signal handler sets `g_sigchld_seen`, and the main loop calls `reap_children()`, which calls `waitpid(-1, &status, WNOHANG)` in a loop to collect all ready children without blocking. For each reaped PID, the matching `container_record_t` is updated with the exit code, terminating signal, and final state (`stopped`, `exited`, or `killed`). Threads waiting on `run` are unblocked via `pthread_cond_broadcast` on the container's `exit_cv`. The `stop_requested` flag distinguishes a graceful supervisor-initiated stop from an unexpected kill.
 
+If a container ignores SIGTERM for more than 2 seconds, the supervisor escalates to SIGKILL via escalate_stubborn_containers(), preventing indefinite hangs during shutdown
+
 ### 4.3 IPC, Threads, and Synchronization
 
 The project uses two distinct IPC mechanisms:
