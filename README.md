@@ -90,8 +90,8 @@ sudo ./engine stop <container_id>
 
 ### 1. Multi-container Supervision
 
-![Multi-container](screenshots/Multi-container Supervision_1.png)
-![Multi-container](screenshots/Multi-container Supervision_2.png)
+![Multi-container](/screenshots/Multi-container%20Supervision_1.png)
+![Multi-container](screenshots/Multi-container%20Supervision_2.png)
 
 ---
 
