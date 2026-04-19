@@ -97,43 +97,43 @@ sudo ./engine stop <container_id>
 
 ### 2. Metadata Tracking (`ps` output)
 
-![Metadata](PASTE_LINK_HERE)
+![Metadata](screenshots/Metadata%20Tracking%20(ps%20output).png)
 
 ---
 
 ### 3. Bounded-buffer Logging
 
-![Logging](PASTE_LINK_HERE)
+![Logging](screenshots/Bounded-buffer%20Logging.png)
 
 ---
 
 ### 4. CLI and IPC
 
-![CLI IPC](PASTE_LINK_HERE)
+![CLI IPC](screenshots/CLI%20and%20IPC.png)
 
 ---
 
 ### 5. Soft-limit Warning
 
-![Soft Limit](PASTE_LINK_HERE)
+![Soft Limit](screenshots/Soft-limit%20Warning.png)
 
 ---
 
 ### 6. Hard-limit Enforcement
 
-![Hard Limit](PASTE_LINK_HERE)
+![Hard Limit](screenshots/Hard-limit%20Enforcement.png)
 
 ---
 
 ### 7. Scheduling Experiment
 
-![Scheduling](PASTE_LINK_HERE)
+![Scheduling](screenshots/Scheduling%20Experiment.png)
 
 ---
 
 ### 8. Clean Teardown (No Zombies)
 
-![Teardown](PASTE_LINK_HERE)
+![Teardown](screenshots/Clean%20Teardown%20(No%20Zombies).png)
 
 ---
 
