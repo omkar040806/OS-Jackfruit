@@ -696,6 +696,12 @@ static int start_container(supervisor_ctx_t *ctx,
     snprintf(rec->log_path, sizeof(rec->log_path), "%s/%s.log", LOG_DIR, req->container_id);
     pthread_cond_init(&rec->exit_cv, NULL);
 
+    {
+        int logfd = open(rec->log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (logfd >= 0)
+            close(logfd);
+    }
+
     memset(cfg, 0, sizeof(*cfg));
     strncpy(cfg->id, req->container_id, sizeof(cfg->id) - 1);
     strncpy(cfg->rootfs, req->rootfs, sizeof(cfg->rootfs) - 1);
@@ -719,8 +725,6 @@ static int start_container(supervisor_ctx_t *ctx,
     }
 
     close(pipefd[1]);
-    free(cfg);
-    free(stack);
 
     rec->host_pid = pid;
     rec->state = CONTAINER_RUNNING;
@@ -764,6 +768,8 @@ static void reap_children(supervisor_ctx_t *ctx)
     pid_t pid;
 
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+    	char unreg_id[CONTAINER_ID_LEN] = {0};
+        pid_t unreg_pid = 0;
         pthread_mutex_lock(&ctx->metadata_lock);
         {
             container_record_t *rec = find_container_by_pid_locked(ctx, pid);
@@ -784,24 +790,30 @@ static void reap_children(supervisor_ctx_t *ctx)
                         rec->state = CONTAINER_KILLED;
                     }
                 }
+                strncpy(unreg_id, rec->id, sizeof(unreg_id) - 1);
+                unreg_pid = rec->host_pid;
                 pthread_cond_broadcast(&rec->exit_cv);
-                unregister_from_monitor(ctx->monitor_fd, rec->id, rec->host_pid);
             }
         }
         pthread_mutex_unlock(&ctx->metadata_lock);
+        if (unreg_pid > 0)
+            unregister_from_monitor(ctx->monitor_fd, unreg_id, unreg_pid);
     }
     g_sigchld_seen = 0;
 }
 
 static void stop_all_containers(supervisor_ctx_t *ctx)
 {
+    time_t now = time(NULL);
+
     pthread_mutex_lock(&ctx->metadata_lock);
     {
         container_record_t *cur = ctx->containers;
         while (cur) {
             if (cur->state == CONTAINER_RUNNING || cur->state == CONTAINER_STARTING) {
                 cur->stop_requested = 1;
-                cur->stop_requested_at = time(NULL);
+                if (cur->stop_requested_at == 0)
+                    cur->stop_requested_at = now;
                 kill(cur->host_pid, SIGTERM);
             }
             cur = cur->next;
@@ -828,6 +840,57 @@ static void escalate_stubborn_containers(supervisor_ctx_t *ctx)
         cur = cur->next;
     }
     pthread_mutex_unlock(&ctx->metadata_lock);
+}
+
+static int has_live_containers(supervisor_ctx_t *ctx)
+{
+    int live = 0;
+    container_record_t *cur;
+
+    pthread_mutex_lock(&ctx->metadata_lock);
+    cur = ctx->containers;
+    while (cur) {
+        if (cur->state == CONTAINER_RUNNING || cur->state == CONTAINER_STARTING) {
+            live = 1;
+            break;
+        }
+        cur = cur->next;
+    }
+    pthread_mutex_unlock(&ctx->metadata_lock);
+
+    return live;
+}
+
+static void shutdown_supervisor_containers(supervisor_ctx_t *ctx)
+{
+    int attempts = 0;
+
+    stop_all_containers(ctx);
+
+    while (has_live_containers(ctx) && attempts < 10) {
+        struct timespec ts;
+
+        ts.tv_sec = 0;
+        ts.tv_nsec = 200 * 1000 * 1000;
+        nanosleep(&ts, NULL);
+
+        reap_children(ctx);
+        escalate_stubborn_containers(ctx);
+        reap_children(ctx);
+        attempts++;
+    }
+
+    while (has_live_containers(ctx)) {
+        struct timespec ts;
+
+        stop_all_containers(ctx);
+        ts.tv_sec = 0;
+        ts.tv_nsec = 200 * 1000 * 1000;
+        nanosleep(&ts, NULL);
+        reap_children(ctx);
+        escalate_stubborn_containers(ctx);
+        reap_children(ctx);
+    }
 }
 
 static void free_all_metadata(supervisor_ctx_t *ctx)
@@ -1111,8 +1174,7 @@ static int run_supervisor(const char *rootfs)
         }
     }
 
-    stop_all_containers(&ctx);
-    sleep(1);
+    shutdown_supervisor_containers(&ctx);
     reap_children(&ctx);
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
