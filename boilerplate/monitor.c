@@ -25,6 +25,7 @@
 #include <linux/timer.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/workqueue.h>
 
 #include "monitor_ioctl.h"
 
@@ -63,6 +64,7 @@ static DEFINE_MUTEX(monitored_list_lock);
 
 /* --- Provided: internal device / timer state --- */
 static struct timer_list monitor_timer;
+static struct delayed_work monitor_work;
 static dev_t dev_num;
 static struct cdev c_dev;
 static struct class *cl;
@@ -136,25 +138,12 @@ static void kill_process(const char *container_id,
            container_id, pid, rss_bytes, limit_bytes);
 }
 
-/* ---------------------------------------------------------------
- * Timer Callback - fires every CHECK_INTERVAL_SEC seconds.
- * --------------------------------------------------------------- */
-static void timer_callback(struct timer_list *t)
+static void monitor_workfn(struct work_struct *work)
 {
     struct monitored_entry *entry, *tmp;
 
-    (void)t;
+    (void)work;
 
-    /* ==============================================================
-     * TODO 3: Implement periodic monitoring.
-     *
-     * Requirements:
-     *   - iterate through tracked entries safely
-     *   - remove entries for exited processes
-     *   - emit soft-limit warning once per entry
-     *   - enforce hard limit and then remove the entry
-     *   - avoid use-after-free while deleting during iteration
-     * ============================================================== */
     mutex_lock(&monitored_list_lock);
     list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
         long rss_bytes = get_rss_bytes(entry->pid);
@@ -183,7 +172,26 @@ static void timer_callback(struct timer_list *t)
         }
     }
     mutex_unlock(&monitored_list_lock);
+}
 
+/* ---------------------------------------------------------------
+ * Timer Callback - fires every CHECK_INTERVAL_SEC seconds.
+ * --------------------------------------------------------------- */
+static void timer_callback(struct timer_list *t)
+{
+    (void)t;
+
+    /* ==============================================================
+     * TODO 3: Implement periodic monitoring.
+     *
+     * Requirements:
+     *   - iterate through tracked entries safely
+     *   - remove entries for exited processes
+     *   - emit soft-limit warning once per entry
+     *   - enforce hard limit and then remove the entry
+     *   - avoid use-after-free while deleting during iteration
+     * ============================================================== */
+    schedule_delayed_work(&monitor_work, 0);
     mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 }
 
@@ -210,7 +218,7 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
     if (cmd == MONITOR_REGISTER) {
         struct monitored_entry *entry;
-        struct monitored_entry *iter;
+        struct monitored_entry *iter, *tmp;
 
         printk(KERN_INFO
                "[container_monitor] Registering container=%s pid=%d soft=%lu hard=%lu\n",
@@ -230,6 +238,8 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return -EINVAL;
         if (req.soft_limit_bytes > req.hard_limit_bytes)
             return -EINVAL;
+        if (req.container_id[0] == '\0')
+            return -EINVAL;
 
         entry = kzalloc(sizeof(*entry), GFP_KERNEL);
         if (!entry)
@@ -243,12 +253,11 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         INIT_LIST_HEAD(&entry->list);
 
         mutex_lock(&monitored_list_lock);
-        list_for_each_entry(iter, &monitored_list, list) {
+        list_for_each_entry_safe(iter, tmp, &monitored_list, list) {
             if (iter->pid == req.pid ||
                 strncmp(iter->container_id, req.container_id, sizeof(iter->container_id)) == 0) {
                 list_del(&iter->list);
                 kfree(iter);
-                break;
             }
         }
         list_add_tail(&entry->list, &monitored_list);
@@ -327,6 +336,7 @@ static int __init monitor_init(void)
         return -1;
     }
 
+    INIT_DELAYED_WORK(&monitor_work, monitor_workfn);
     timer_setup(&monitor_timer, timer_callback, 0);
     mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 
@@ -340,6 +350,7 @@ static void __exit monitor_exit(void)
     struct monitored_entry *entry, *tmp;
 
     del_timer_sync(&monitor_timer);
+    cancel_delayed_work_sync(&monitor_work);
 
     /* ==============================================================
      * TODO 6: Free all remaining monitored entries.
@@ -367,5 +378,4 @@ module_init(monitor_init);
 module_exit(monitor_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("OpenAI");
 MODULE_DESCRIPTION("Container memory monitor with soft/hard limits");
